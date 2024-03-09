@@ -1,5 +1,6 @@
 package com.yq.yqBI.controller;
 
+import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
@@ -14,6 +15,7 @@ import com.yq.yqBI.constant.UserConstant;
 import com.yq.yqBI.exception.BusinessException;
 import com.yq.yqBI.exception.ThrowUtils;
 import com.yq.yqBI.manager.AiManager;
+import com.yq.yqBI.manager.RedisLimiterManager;
 import com.yq.yqBI.model.dto.chart.*;
 import com.yq.yqBI.model.entity.Chart;
 import com.yq.yqBI.model.entity.User;
@@ -31,6 +33,8 @@ import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * 帖子接口
@@ -51,6 +55,9 @@ public class ChartController {
 
     @Resource
     private AiManager aiManager;
+
+    @Resource
+    private RedisLimiterManager redisLimiterManager;
 
     private final static Gson GSON = new Gson();
 
@@ -238,7 +245,22 @@ public class ChartController {
         ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
         ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
 
+        // 校验文件大小和后缀
+        long size = multipartFile.getSize();
+        String originalFilename = multipartFile.getOriginalFilename();
+
+        final long maxSize = 1024 * 1024L;
+        ThrowUtils.throwIf(size > maxSize, ErrorCode.PARAMS_ERROR, "文件大小超过1M");
+
+        // 利用 hutool 工具类得到文件的后缀
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> suffixList = Arrays.asList("csv", "xlsx");
+        ThrowUtils.throwIf(!suffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "文件格式不正确");
+
         User loginUser = userService.getLoginUser(request);
+
+        // 限流
+        redisLimiterManager.doRateLimit("genChartByAI_" + loginUser.getId());
 
         // AI 预设
 //        final String prompt = "你是一个数据分析师和前端开发专家，接下来我会按照以下固定格式给你提供内容:\n" +
