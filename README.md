@@ -1,7 +1,6 @@
 # SpringBoot 项目初始模板
 
-> 作者：[程序员鱼皮](https://github.com/liyupi)
-> 仅分享于 [编程导航知识星球](https://yupi.icu)
+> 作者：[lyqq](https://github.com/lyq15935020250)
 
 基于 Java SpringBoot 的项目初始模板，整合了常用框架和主流业务的示例代码。
 
@@ -13,7 +12,7 @@
 
 ### 主流框架 & 特性
 
-- Spring Boot 2.7.x（贼新）
+- Spring Boot 2.7.x
 - Spring MVC
 - MyBatis + MyBatis Plus 数据访问（开启分页）
 - Spring Boot 调试工具和项目处理器
@@ -73,8 +72,6 @@
 
 
 ## 快速上手
-
-> 所有需要修改的地方鱼皮都标记了 `todo`，便于大家找到修改的位置~
 
 ### MySQL 数据库
 

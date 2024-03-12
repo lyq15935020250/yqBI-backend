@@ -19,6 +19,7 @@ import com.yq.yqBI.manager.RedisLimiterManager;
 import com.yq.yqBI.model.dto.chart.*;
 import com.yq.yqBI.model.entity.Chart;
 import com.yq.yqBI.model.entity.User;
+import com.yq.yqBI.model.enums.ChartStatusEnum;
 import com.yq.yqBI.model.vo.BiResponse;
 import com.yq.yqBI.service.ChartService;
 import com.yq.yqBI.service.UserService;
@@ -35,6 +36,8 @@ import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * 帖子接口
@@ -55,6 +58,9 @@ public class ChartController {
 
     @Resource
     private AiManager aiManager;
+
+    @Resource
+    private ThreadPoolExecutor threadPoolExecutor;
 
     @Resource
     private RedisLimiterManager redisLimiterManager;
@@ -227,7 +233,7 @@ public class ChartController {
 
 
     /**
-     * 智能分析
+     * 智能分析（同步）
      *
      * @param multipartFile
      * @param genChartByAiRequest
@@ -254,7 +260,7 @@ public class ChartController {
 
         // 利用 hutool 工具类得到文件的后缀
         String suffix = FileUtil.getSuffix(originalFilename);
-        final List<String> suffixList = Arrays.asList("csv", "xlsx");
+        final List<String> suffixList = Arrays.asList("csv", "xlsx", "xls");
         ThrowUtils.throwIf(!suffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "文件格式不正确");
 
         User loginUser = userService.getLoginUser(request);
@@ -328,6 +334,152 @@ public class ChartController {
 
         return ResultUtils.success(biResponse);
 
+    }
+
+    /**
+     * 智能分析（异步）
+     *
+     * @param multipartFile
+     * @param genChartByAiRequest
+     * @param request
+     * @return
+     */
+    @PostMapping("/gen/async")
+    public BaseResponse<BiResponse> genChartByAiAsync(@RequestPart("file") MultipartFile multipartFile,
+                                                 GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+
+        String name = genChartByAiRequest.getName();
+        String goal = genChartByAiRequest.getGoal();
+        String chartType = genChartByAiRequest.getChartType();
+        // 校验
+        ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
+        ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+
+        // 校验文件大小和后缀
+        long size = multipartFile.getSize();
+        String originalFilename = multipartFile.getOriginalFilename();
+
+        final long maxSize = 1024 * 1024L;
+        ThrowUtils.throwIf(size > maxSize, ErrorCode.PARAMS_ERROR, "文件大小超过1M");
+
+        // 利用 hutool 工具类得到文件的后缀
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> suffixList = Arrays.asList("csv", "xlsx", "xls");
+        ThrowUtils.throwIf(!suffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "文件格式不正确");
+
+        User loginUser = userService.getLoginUser(request);
+
+        // 限流
+        redisLimiterManager.doRateLimit("genChartByAI_" + loginUser.getId());
+
+        // AI 预设
+//        final String prompt = "你是一个数据分析师和前端开发专家，接下来我会按照以下固定格式给你提供内容:\n" +
+//                "分析需求:\n" +
+//                "{数据分析的需求或者目标}\n" +
+//                "原始数据:\n" +
+//                "{csv格式的原始数据，用,作为分隔符}\n" +
+//                "请根据这两部分内容，按照以下指定格式生成内容（此外不要输出任何多余的开头、结尾、注释)\n" +
+//                "【【【【【\n" +
+//                "{前端Echarts V5的 option配置对象js代码，合理地将数据进行可视化，不要生成任何多余的内容，比如注释}\n" +
+//                "【【【【【\n" +
+//                "{明确的数据分析结论、越详细越好，不要生成多余的注释}";
+
+//        分析需求:
+//        分析网站用户的增长情况
+//        原始数据:
+//        日期,用户数
+//        1号,10
+//        2号,20
+//        3号,30
+
+        // 用户输入
+        StringBuilder userInput = new StringBuilder();
+        userInput.append("分析需求：").append("\n");
+
+        String userGoal = goal;
+        if (StrUtil.isNotBlank(chartType)){
+            userGoal += ",请使用" + chartType;
+        }
+
+        userInput.append(userGoal).append("\n");
+        userInput.append("原始数据:").append("\n");
+        // 压缩后的数据
+        String csvDate = ExcelUtils.excelToCsv(multipartFile);
+        userInput.append(csvDate).append("\n");
+
+
+        // 插入数据库
+        Chart chart = new Chart();
+        chart.setName(name);
+        chart.setGoal(goal);
+        chart.setChartData(csvDate);
+        chart.setChartType(chartType);
+        // 设置任务状态码为等待中
+        chart.setStatus(ChartStatusEnum.WAIT.getValue());
+        chart.setUserId(loginUser.getId());
+        boolean saveResult = chartService.save(chart);
+        ThrowUtils.throwIf(!saveResult,ErrorCode.SYSTEM_ERROR,"图表保存失败");
+
+        try {
+            CompletableFuture.runAsync(() -> {
+                // 第二次跟新数据库，设置任务状态为执行中
+                Chart runChart = new Chart();
+                runChart.setId(chart.getId());
+                runChart.setStatus(ChartStatusEnum.RUNNING.getValue());
+                boolean b = chartService.updateById(runChart);
+                // 一般不会出错，除非数据库出问题
+                if (!b){
+                    handlerChartUpdateError(chart.getId(), "更新图表任务为执行中更新失败");
+                    return;
+                }
+
+                // 获取到 AI 响应结果
+                String result = aiManager.doChart(BiModelId, userInput.toString());
+
+                String[] split = result.split("【【【【【");
+                if (split.length < 3){
+                    throw new BusinessException(ErrorCode.SYSTEM_ERROR,"AI 生成错误");
+                }
+
+                String genChart = split[1].trim();
+                String genResult = split[2].trim();
+
+                // 第三次更新数据库，得到调用 AI 的结果后，更新图表详情、分析结论、图表执行状态为 success
+                Chart chartResult = new Chart();
+                chartResult.setId(chart.getId());
+                chartResult.setGenChart(genChart);
+                chartResult.setGenResult(genResult);
+                chartResult.setStatus(ChartStatusEnum.SUCCEED.getValue());
+                boolean updateResult = chartService.updateById(chartResult);
+                if (!updateResult){
+                    handlerChartUpdateError(chart.getId(), "更新图表状态为成功更新失败");
+                }
+
+            }, threadPoolExecutor);
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR,"图表生成失败，" + e.getMessage());
+        }
+
+
+
+
+        BiResponse biResponse = new BiResponse();
+//        biResponse.setGenChart(genChart);
+//        biResponse.setGenResult(genResult);
+        biResponse.setChartId(chart.getId());
+        return ResultUtils.success(biResponse);
+
+    }
+
+    private void handlerChartUpdateError(Long chartId,String execMessage){
+        Chart chart = new Chart();
+        chart.setId(chartId);
+        chart.setStatus(ChartStatusEnum.FAILED.getValue());
+        chart.setGenChart(execMessage);
+        boolean b = chartService.updateById(chart);
+        if (!b){
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR,"修改失败状态失败");
+        }
     }
 
 
