@@ -6,10 +6,12 @@ import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.google.gson.Gson;
 import com.yq.yqBI.annotation.AuthCheck;
+import com.yq.yqBI.bimq.BiMessageProducer;
 import com.yq.yqBI.common.BaseResponse;
 import com.yq.yqBI.common.DeleteRequest;
 import com.yq.yqBI.common.ErrorCode;
 import com.yq.yqBI.common.ResultUtils;
+import com.yq.yqBI.constant.AiConstant;
 import com.yq.yqBI.constant.CommonConstant;
 import com.yq.yqBI.constant.UserConstant;
 import com.yq.yqBI.exception.BusinessException;
@@ -65,9 +67,10 @@ public class ChartController {
     @Resource
     private RedisLimiterManager redisLimiterManager;
 
-    private final static Gson GSON = new Gson();
+    @Resource
+    private BiMessageProducer biMessageProducer;
 
-    private final long BiModelId = 1765029821865742338L;
+    private final long BiModelId = AiConstant.BiModelId;
 
     // region 增删改查
 
@@ -337,15 +340,15 @@ public class ChartController {
     }
 
     /**
-     * 智能分析（异步）
+     * 智能分析（异步 MQ ）
      *
      * @param multipartFile
      * @param genChartByAiRequest
      * @param request
      * @return
      */
-    @PostMapping("/gen/async")
-    public BaseResponse<BiResponse> genChartByAiAsync(@RequestPart("file") MultipartFile multipartFile,
+    @PostMapping("/gen/async/mq")
+    public BaseResponse<BiResponse> genChartByAiAsyncMq(@RequestPart("file") MultipartFile multipartFile,
                                                  GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
 
         String name = genChartByAiRequest.getName();
@@ -467,6 +470,90 @@ public class ChartController {
 //        biResponse.setGenChart(genChart);
 //        biResponse.setGenResult(genResult);
         biResponse.setChartId(chart.getId());
+        return ResultUtils.success(biResponse);
+
+    }@PostMapping("/gen/async")
+    public BaseResponse<BiResponse> genChartByAiAsync(@RequestPart("file") MultipartFile multipartFile,
+                                                 GenChartByAiRequest genChartByAiRequest, HttpServletRequest request) {
+
+        String name = genChartByAiRequest.getName();
+        String goal = genChartByAiRequest.getGoal();
+        String chartType = genChartByAiRequest.getChartType();
+        // 校验
+        ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
+        ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+
+        // 校验文件大小和后缀
+        long size = multipartFile.getSize();
+        String originalFilename = multipartFile.getOriginalFilename();
+
+        final long maxSize = 1024 * 1024L;
+        ThrowUtils.throwIf(size > maxSize, ErrorCode.PARAMS_ERROR, "文件大小超过1M");
+
+        // 利用 hutool 工具类得到文件的后缀
+        String suffix = FileUtil.getSuffix(originalFilename);
+        final List<String> suffixList = Arrays.asList("csv", "xlsx", "xls");
+        ThrowUtils.throwIf(!suffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "文件格式不正确");
+
+        User loginUser = userService.getLoginUser(request);
+
+        // 限流
+        redisLimiterManager.doRateLimit("genChartByAI_" + loginUser.getId());
+
+        // AI 预设
+//        final String prompt = "你是一个数据分析师和前端开发专家，接下来我会按照以下固定格式给你提供内容:\n" +
+//                "分析需求:\n" +
+//                "{数据分析的需求或者目标}\n" +
+//                "原始数据:\n" +
+//                "{csv格式的原始数据，用,作为分隔符}\n" +
+//                "请根据这两部分内容，按照以下指定格式生成内容（此外不要输出任何多余的开头、结尾、注释)\n" +
+//                "【【【【【\n" +
+//                "{前端Echarts V5的 option配置对象js代码，合理地将数据进行可视化，不要生成任何多余的内容，比如注释}\n" +
+//                "【【【【【\n" +
+//                "{明确的数据分析结论、越详细越好，不要生成多余的注释}";
+
+//        分析需求:
+//        分析网站用户的增长情况
+//        原始数据:
+//        日期,用户数
+//        1号,10
+//        2号,20
+//        3号,30
+
+        // 用户输入
+        StringBuilder userInput = new StringBuilder();
+        userInput.append("分析需求：").append("\n");
+
+        String userGoal = goal;
+        if (StrUtil.isNotBlank(chartType)){
+            userGoal += ",请使用" + chartType;
+        }
+
+        userInput.append(userGoal).append("\n");
+        userInput.append("原始数据:").append("\n");
+        // 压缩后的数据
+        String csvDate = ExcelUtils.excelToCsv(multipartFile);
+        userInput.append(csvDate).append("\n");
+
+
+        // 插入数据库
+        Chart chart = new Chart();
+        chart.setName(name);
+        chart.setGoal(goal);
+        chart.setChartData(csvDate);
+        chart.setChartType(chartType);
+        // 设置任务状态码为等待中
+        chart.setStatus(ChartStatusEnum.WAIT.getValue());
+        chart.setUserId(loginUser.getId());
+        boolean saveResult = chartService.save(chart);
+        ThrowUtils.throwIf(!saveResult,ErrorCode.SYSTEM_ERROR,"图表保存失败");
+
+        Long newChartId = chart.getId();
+        // 发送消息
+        biMessageProducer.sendMessage(String.valueOf(newChartId));
+
+        BiResponse biResponse = new BiResponse();
+        biResponse.setChartId(newChartId);
         return ResultUtils.success(biResponse);
 
     }
